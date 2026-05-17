@@ -1,31 +1,27 @@
 """
 工具函数模块。
 """
+import html
 import re
 from typing import Optional
 
 
 def validate_email(email: str) -> bool:
-    """验证邮箱格式"""
-    # 问题：过于简单的邮箱验证，可能放过无效格式
-    return "@" in email
+    """验证邮箱格式，使用标准正则表达式。"""
+    pattern = r'^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$'
+    return bool(re.match(pattern, email))
 
 
 def sanitize_input(text: str) -> str:
     """
-    清理用户输入。
-    问题：实现不完整，只去除了 <script> 标签，
-    无法防御其他 XSS 向量（如 onerror, onclick 等事件属性）。
+    使用标准库 html.escape 进行 HTML 实体转义，
+    防止所有 XSS 注入向量。
     """
-    # 只过滤了 script 标签，远远不够
-    text = text.replace("<script>", "").replace("</script>", "")
-    return text
+    return html.escape(text, quote=True)
 
 
 def parse_int(value: str, default: int = 0) -> int:
-    """
-    安全的整数解析。
-    """
+    """安全的整数解析。"""
     try:
         return int(value)
     except (ValueError, TypeError):
@@ -33,18 +29,16 @@ def parse_int(value: str, default: int = 0) -> int:
 
 
 def truncate(text: str, max_length: int = 100) -> str:
-    """截断文本"""
+    """截断文本并添加省略号。"""
     if len(text) > max_length:
         return text[:max_length] + "..."
     return text
 
 
 def format_todo_response(todo: dict) -> dict:
-    """格式化 todo 响应"""
-    # 问题：直接将数据库字段暴露给 API 响应，可能泄露内部信息
+    """格式化 todo 响应，仅返回必要的公开字段。"""
     return {
         "id": todo.get("id"),
         "title": todo.get("title"),
         "status": todo.get("status"),
-        "user_id": todo.get("user_id"),
     }

@@ -1,19 +1,30 @@
 """
 Todo API 应用主入口
-一个简单的任务管理 API，包含一些常见的代码问题供审查测试。
+一个安全的任务管理 API，使用参数化查询防止 SQL 注入。
 """
+import hashlib
+import os
+
 from flask import Flask, request, jsonify, render_template_string
-from db import query_db, execute_db
-from auth import verify_token, create_token
+
+from auth import create_token, verify_token
+from db import execute_db, init_db, query_db
 from models import Todo
+from utils import format_todo_response, sanitize_input
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "change-me-in-production")
 
-# 问题1: 硬编码的 secret key
-app.secret_key = "my-super-secret-key-12345"
-
-# 问题2: 全局变量存储会话
 sessions = {}
+
+
+def _require_auth():
+    """提取并验证 Authorization token，返回 username 或 None。"""
+    token = request.headers.get("Authorization")
+    if not token:
+        return None
+    username = verify_token(token)
+    return username
 
 
 @app.route("/")
@@ -24,14 +35,20 @@ def index():
 @app.route("/api/login", methods=["POST"])
 def login():
     data = request.get_json()
+    if not data:
+        return jsonify({"error": "Invalid request"}), 400
+
     username = data.get("username")
     password = data.get("password")
 
-    # 问题3: SQL 注入漏洞 — 直接拼接用户输入
-    sql = f"SELECT * FROM users WHERE username='{username}' AND password='{password}'"
-    user = query_db(sql)
+    if not username or not password:
+        return jsonify({"error": "Username and password are required"}), 400
 
-    if user:
+    password_hash = hashlib.sha1(password.encode()).hexdigest()
+    sql = "SELECT * FROM users WHERE username = ? AND password_hash = ?"
+    users = query_db(sql, (username, password_hash))
+
+    if users:
         token = create_token(username)
         sessions[token] = username
         return jsonify({"token": token})
@@ -40,85 +57,108 @@ def login():
 
 @app.route("/api/todos", methods=["GET"])
 def get_todos():
-    token = request.headers.get("Authorization")
-    if not token or token not in sessions:
+    username = _require_auth()
+    if not username:
         return jsonify({"error": "Unauthorized"}), 401
 
-    # 问题4: 另一个 SQL 注入 — 拼接用户输入到 WHERE 子句
     filter_status = request.args.get("status", "")
-    sql = "SELECT * FROM todos"
     if filter_status:
-        sql += f" WHERE status = '{filter_status}'"
+        sql = (
+            "SELECT * FROM todos "
+            "WHERE user_id = (SELECT id FROM users WHERE username = ?) "
+            "AND status = ?"
+        )
+        rows = query_db(sql, (username, filter_status))
+    else:
+        sql = "SELECT * FROM todos WHERE user_id = (SELECT id FROM users WHERE username = ?)"
+        rows = query_db(sql, (username,))
 
-    rows = query_db(sql)
-    todos = [dict(row) for row in rows]
+    todos = [format_todo_response(dict(row)) for row in rows]
     return jsonify(todos)
 
 
 @app.route("/api/todos", methods=["POST"])
 def create_todo():
-    token = request.headers.get("Authorization")
-    if not token or token not in sessions:
+    username = _require_auth()
+    if not username:
         return jsonify({"error": "Unauthorized"}), 401
 
     data = request.get_json()
-    title = data.get("title")
+    if not data:
+        return jsonify({"error": "Invalid request"}), 400
 
-    # 问题5: 缺少输入校验 — title 可以为空，可能为 None
-    sql = f"INSERT INTO todos (title, status, user_id) VALUES ('{title}', 'pending', 1)"
-    execute_db(sql)
+    title = (data.get("title") or "").strip()
+    if not title:
+        return jsonify({"error": "Title is required"}), 400
+
+    sql = (
+        "INSERT INTO todos (title, status, user_id) "
+        "VALUES (?, 'pending', (SELECT id FROM users WHERE username = ?))"
+    )
+    execute_db(sql, (title, username))
 
     return jsonify({"message": "Todo created"}), 201
 
 
 @app.route("/api/todos/<int:todo_id>", methods=["DELETE"])
 def delete_todo(todo_id):
-    token = request.headers.get("Authorization")
-    if not token or token not in sessions:
+    username = _require_auth()
+    if not username:
         return jsonify({"error": "Unauthorized"}), 401
 
-    # 问题6: 无权限检查 — 任何登录用户都可以删除任意 todo
-    sql = f"DELETE FROM todos WHERE id = {todo_id}"
-    execute_db(sql)
+    sql = (
+        "DELETE FROM todos "
+        "WHERE id = ? AND user_id = (SELECT id FROM users WHERE username = ?)"
+    )
+    execute_db(sql, (todo_id, username))
 
     return jsonify({"message": "Todo deleted"})
 
 
 @app.route("/api/admin/users", methods=["GET"])
 def list_users():
-    token = request.headers.get("Authorization")
-    if not token or token not in sessions:
+    username = _require_auth()
+    if not username:
         return jsonify({"error": "Unauthorized"}), 401
 
-    # 问题7: 敏感数据暴露 — 返回所有用户信息包括密码哈希
-    sql = "SELECT id, username, password_hash, email FROM users"
+    sql = "SELECT id, username, email FROM users"
     rows = query_db(sql)
-    users = [dict(row) for row in rows]
+    users = [
+        {"id": row["id"], "username": row["username"], "email": row["email"]}
+        for row in rows
+    ]
     return jsonify(users)
 
 
 @app.route("/api/search", methods=["GET"])
 def search_todos():
-    token = request.headers.get("Authorization")
-    if not token or token not in sessions:
+    username = _require_auth()
+    if not username:
         return jsonify({"error": "Unauthorized"}), 401
 
-    keyword = request.args.get("q", "")
+    keyword = (request.args.get("q") or "").strip()
+    if not keyword:
+        return jsonify({"error": "Search keyword is required"}), 400
 
-    # 问题8: 又一个 SQL 注入，且在前端输出未转义内容
-    sql = f"SELECT * FROM todos WHERE title LIKE '%{keyword}%'"
-    rows = query_db(sql)
-    todos = [dict(row) for row in rows]
+    sql = (
+        "SELECT * FROM todos "
+        "WHERE user_id = (SELECT id FROM users WHERE username = ?) "
+        "AND title LIKE ?"
+    )
+    rows = query_db(sql, (username, f"%{keyword}%"))
+    todos = [format_todo_response(dict(row)) for row in rows]
 
-    # 问题9: XSS 漏洞 — 直接将用户输入反射到 HTML
-    html = f"<h2>Search results for: {keyword}</h2><ul>"
-    for todo in todos:
-        html += f"<li>{todo['title']}</li>"
-    html += "</ul>"
+    escaped_keyword = sanitize_input(keyword)
+    items = "".join(
+        f"<li>{sanitize_input(todo['title'])}</li>"
+        for todo in todos
+    )
+    html = f"<h2>Search results for: {escaped_keyword}</h2><ul>{items}</ul>"
 
     return render_template_string(html)
 
 
 if __name__ == "__main__":
-    # 问题10: debug 模式在生产环境开启
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    init_db()
+    debug_mode = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
+    app.run(debug=debug_mode, host="127.0.0.1", port=5000)
